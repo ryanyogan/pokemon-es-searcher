@@ -8,11 +8,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/teris-io/shortid"
-
 	"github.com/gin-gonic/gin"
-
 	"github.com/olivere/elastic"
+	"github.com/teris-io/shortid"
 )
 
 const (
@@ -20,11 +18,6 @@ const (
 	elasticTypeName  = "document"
 )
 
-var (
-	elasticClient *elastic.Client
-)
-
-// Document defines the fields for a Document object
 type Document struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
@@ -32,7 +25,6 @@ type Document struct {
 	Content   string    `json:"content"`
 }
 
-// DocumentResponse - The request payload for document requests
 type DocumentRequest struct {
 	Title   string `json:"title"`
 	Content string `json:"content"`
@@ -50,24 +42,47 @@ type SearchResponse struct {
 	Documents []DocumentResponse `json:"documents"`
 }
 
-func errorResponse(c *gin.Context, code int, err string) {
-	c.JSON(code, gin.H{
-		"error": err,
-	})
+var (
+	elasticClient *elastic.Client
+)
+
+func main() {
+	var err error
+	// Create Elastic client and wait for Elasticsearch to be ready
+	for {
+		elasticClient, err = elastic.NewClient(
+			elastic.SetURL("http://elasticsearch:9200"),
+			elastic.SetSniff(false),
+		)
+		if err != nil {
+			log.Println(err)
+			// Retry every 3 seconds
+			time.Sleep(3 * time.Second)
+		} else {
+			break
+		}
+	}
+	// Start HTTP server
+	r := gin.Default()
+	r.POST("/documents", createDocumentsEndpoint)
+	r.GET("/search", searchEndpoint)
+	if err = r.Run(":8080"); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func createDocumentsEndpoint(c *gin.Context) {
+	// Parse request
 	var docs []DocumentRequest
 	if err := c.BindJSON(&docs); err != nil {
 		errorResponse(c, http.StatusBadRequest, "Malformed request body")
 		return
 	}
-
+	// Insert documents in bulk
 	bulk := elasticClient.
 		Bulk().
 		Index(elasticIndexName).
 		Type(elasticTypeName)
-
 	for _, d := range docs {
 		doc := Document{
 			ID:        shortid.MustGenerate(),
@@ -77,7 +92,6 @@ func createDocumentsEndpoint(c *gin.Context) {
 		}
 		bulk.Add(elastic.NewBulkIndexRequest().Id(doc.ID).Doc(doc))
 	}
-
 	if _, err := bulk.Do(c.Request.Context()); err != nil {
 		log.Println(err)
 		errorResponse(c, http.StatusInternalServerError, "Failed to create documents")
@@ -87,23 +101,21 @@ func createDocumentsEndpoint(c *gin.Context) {
 }
 
 func searchEndpoint(c *gin.Context) {
-	// Parse the request
+	// Parse request
 	query := c.Query("query")
 	if query == "" {
 		errorResponse(c, http.StatusBadRequest, "Query not specified")
 		return
 	}
-
 	skip := 0
 	take := 10
-
-	if i, err := strconv.Atoi(c.Query("skip")); err != nil {
+	if i, err := strconv.Atoi(c.Query("skip")); err == nil {
 		skip = i
 	}
-	if i, err := strconv.Atoi(c.Query("take")); err != nil {
+	if i, err := strconv.Atoi(c.Query("take")); err == nil {
 		take = i
 	}
-
+	// Perform search
 	esQuery := elastic.NewMultiMatchQuery(query, "title", "content").
 		Fuzziness("2").
 		MinimumShouldMatch("2")
@@ -113,49 +125,27 @@ func searchEndpoint(c *gin.Context) {
 		From(skip).Size(take).
 		Do(c.Request.Context())
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
 		errorResponse(c, http.StatusInternalServerError, "Something went wrong")
 		return
 	}
-
 	res := SearchResponse{
 		Time: fmt.Sprintf("%d", result.TookInMillis),
 		Hits: fmt.Sprintf("%d", result.Hits.TotalHits),
 	}
+	// Transform search results before returning them
 	docs := make([]DocumentResponse, 0)
 	for _, hit := range result.Hits.Hits {
 		var doc DocumentResponse
 		json.Unmarshal(*hit.Source, &doc)
 		docs = append(docs, doc)
 	}
-
 	res.Documents = docs
 	c.JSON(http.StatusOK, res)
 }
 
-func main() {
-	var err error
-	for {
-		elasticClient, err = elastic.NewClient(
-			elastic.SetURL("http://elasticsearch:9200"),
-			elastic.SetSniff(false),
-		)
-		if err != nil {
-			log.Println(err)
-			log.Println("Waiting 3 seconds...")
-			time.Sleep(3 * time.Second)
-			log.Println("Attempting to connect to ES again...")
-		} else {
-			log.Println("Could not connect to Elastic Search...")
-			break
-		}
-	}
-
-	r := gin.Default()
-	r.POST("/documents", createDocumentsEndpoint)
-	r.GET("/search", searchEndpoint)
-
-	if err := r.Run(":8080"); err != nil {
-		log.Fatal(err)
-	}
+func errorResponse(c *gin.Context, code int, err string) {
+	c.JSON(code, gin.H{
+		"error": err,
+	})
 }
